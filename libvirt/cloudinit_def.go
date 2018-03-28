@@ -10,28 +10,34 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
+	"encoding/json"
 
 	"github.com/hooklift/iso9660"
 	"github.com/imdario/mergo"
 	libvirt "github.com/libvirt/libvirt-go"
 	"github.com/mitchellh/packer/common/uuid"
 	"gopkg.in/yaml.v2"
+	"bytes"
 )
 
 // userData is the filename expected by cloud-init
-const userData string = "user-data"
+const userData string = "user_data"
 
 // metaData is the filename expected by cloud-init
-const metaData string = "meta-data"
+const metaData string = "meta_data.json"
+
+const openStackDir string = "/openstack/latest"
 
 type defCloudInitUserData struct {
 	SSHAuthorizedKeys []string `yaml:"ssh_authorized_keys"`
 }
 
 type defCloudInitMetaData struct {
-	LocalHostname string `yaml:"local-hostname,omitempty"`
-	InstanceID    string `yaml:"instance-id"`
+	//AvailabilityZone string `json:"availability_zone,omitempty"`
+	//PublicKeys []string `json:"public_keys,omitempty"`
+	//Files []string `json:"files,omitempty"`
+	Hostname string `json:"hostname"`
+	Uuid    string `json:"uuid"`
 }
 
 type defCloudInit struct {
@@ -47,7 +53,8 @@ type defCloudInit struct {
 func newCloudInitDef() defCloudInit {
 	return defCloudInit{
 		MetaData: defCloudInitMetaData{
-			InstanceID: fmt.Sprintf("created-at-%s", time.Now().String()),
+			Hostname: "rancher",
+			Uuid: uuid.TimeOrderedUUID(),
 		},
 	}
 }
@@ -152,22 +159,29 @@ func (ci *defCloudInit) createISO() (string, error) {
 
 	isoDestination := filepath.Join(tmpDir, ci.Name)
 	cmd := exec.Command(
-		"mkisofs",
-		"-output",
+		"genisoimage",
+		"-o",
 		isoDestination,
-		"-volid",
-		"cidata",
-		"-joliet",
-		"-rock",
-		filepath.Join(tmpDir, userData),
-		filepath.Join(tmpDir, metaData))
+		"-J",
+		"-l",
+		"-r",
+		"-v",
+		"-input-charset",
+		"utf-8",
+		"-V",
+		"config-2",
+		tmpDir)
 
 	log.Printf("About to execute cmd: %+v", cmd)
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
 	if err = cmd.Run(); err != nil {
-		return "", fmt.Errorf("Error while starting the creation of CloudInit's ISO image: %s", err)
+		return "", fmt.Errorf("Error while starting the creation of CloudInit's ISO image: %s:%s:%s", err, out.String(), stderr.String())
 	}
-	log.Printf("ISO created at %s", isoDestination)
 
+	log.Printf("ISO created at %s", isoDestination)
 	return isoDestination, nil
 }
 
@@ -183,6 +197,11 @@ func (ci *defCloudInit) createFiles() (string, error) {
 			err)
 	}
 
+	if err := os.MkdirAll(tmpDir + openStackDir, 0755); err != nil {
+		return "", fmt.Errorf("Unable to create openstack folder under tmp folder due to %s", err)
+	}
+	dataDir := tmpDir + openStackDir
+
 	// Create files required by ISO file
 	mergedUserData, err := mergeUserDataIntoUserDataRaw(ci.UserData, ci.UserDataRaw)
 	if err != nil {
@@ -191,17 +210,17 @@ func (ci *defCloudInit) createFiles() (string, error) {
 	userdata := fmt.Sprintf("#cloud-config\n%s", mergedUserData)
 
 	if err = ioutil.WriteFile(
-		filepath.Join(tmpDir, userData),
+		filepath.Join(dataDir, userData),
 		[]byte(userdata),
 		os.ModePerm); err != nil {
 		return "", fmt.Errorf("Error while writing user-data to file: %s", err)
 	}
 
-	metadata, err := yaml.Marshal(&ci.MetaData)
+	metadata, err := json.Marshal(&ci.MetaData)
 	if err != nil {
 		return "", fmt.Errorf("Error dumping cloudinit's meta data: %s", err)
 	}
-	if err = ioutil.WriteFile(filepath.Join(tmpDir, metaData), metadata, os.ModePerm); err != nil {
+	if err = ioutil.WriteFile(filepath.Join(dataDir, metaData), metadata, os.ModePerm); err != nil {
 		return "", fmt.Errorf("Error while writing meta-data to file: %s", err)
 	}
 
@@ -292,7 +311,7 @@ func newCloudInitDefFromRemoteISO(virConn *libvirt.Connect, id string) (defCloud
 			if err != nil {
 				return ci, fmt.Errorf("Error while reading %s: %s", metaData, err)
 			}
-			if err := yaml.Unmarshal(data, &ci.MetaData); err != nil {
+			if err := json.Unmarshal(data, &ci.MetaData); err != nil {
 				return ci, fmt.Errorf("Error while unmarshalling user-data: %s", err)
 			}
 		}
@@ -374,6 +393,5 @@ func mergeUserDataIntoUserDataRaw(userData defCloudInitUserData, userDataRaw str
 	if err != nil {
 		return "", err
 	}
-
 	return string(out[:]), nil
 }
